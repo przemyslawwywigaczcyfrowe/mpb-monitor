@@ -41,7 +41,9 @@
  * ============================================================================
  */
 
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+chromium.use(StealthPlugin());                       // headless mniej wykrywalny dla Cloudflare
 const { SheetClient, normalizeUrl } = require('./sheets');
 
 const BASE = 'https://www.mpb.com';
@@ -123,22 +125,44 @@ async function launch() {
 
 // Wejście na stronę nie-chronioną → Cloudflare ustawia/odświeża cookie __cf_bm w kontekście.
 // __cf_bm żyje ~30 min, więc rozgrzewamy na starcie i ponawiamy, gdy fetch-e zaczną dostawać challenge.
+// Cloudflare pokazuje różne tytuły challenge: "Just a moment..." (standard) i "MPB - Security check"
+// (managed). Oba rozwiązują się SAME po wykonaniu JS przez prawdziwą przeglądarkę — trzeba poczekać.
+const CHALLENGE_RE = /just a moment|security check|attention required|checking your browser|enable javascript and cookies/i;
+const isChallengeTitle = (t) => CHALLENGE_RE.test(t || '');
+
+// Rozgrzewka: wejście na stronę nie-chronioną; ponawia aż Cloudflare przepuści i ustawi cf_clearance.
+// KLUCZOWE: dopiero po realnym przejściu challenge'a (pełną nawigacją) działają potem szybkie `fetch`.
 async function warmUp(page) {
-  await gotoSafe(page, `${BASE}/${LOCALE}`, { waitSelector: '#__NEXT_DATA__' });
-  log('warm-up OK (homepage):', await page.title().catch(() => '?'));
+  for (let i = 1; i <= 5; i++) {
+    await gotoSafe(page, `${BASE}/${LOCALE}`, { waitSelector: '#__NEXT_DATA__' });
+    const hasData = await page.$('#__NEXT_DATA__').catch(() => null);
+    const title = await page.title().catch(() => '');
+    if (hasData && !isChallengeTitle(title)) { log('warm-up OK (homepage):', title); return true; }
+    log(`warm-up próba ${i}: nadal Cloudflare ("${title}") — czekam i ponawiam.`);
+    await page.waitForTimeout(5000);
+  }
+  log('warm-up: NIE udało się przejść Cloudflare po 5 próbach.');
+  return false;
 }
 
-// Nawigacja odporna na challenge: czeka aż Cloudflare przepuści i pojawi się __NEXT_DATA__.
-async function gotoSafe(page, url, { waitSelector = '#__NEXT_DATA__' } = {}) {
+// Nawigacja odporna na challenge: czeka aż JS-challenge sam się rozwiąże i pojawi się __NEXT_DATA__
+// (raz w trakcie próbuje reload, gdyby challenge się zaciął).
+async function gotoSafe(page, url, { waitSelector = '#__NEXT_DATA__', maxWaitMs = 45000 } = {}) {
   let lastStatus = 0;
   const resp = await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => null);
   if (resp) lastStatus = resp.status();
-  for (let i = 0; i < 4; i++) {
+  const start = Date.now();
+  let reloaded = false;
+  while (Date.now() - start < maxWaitMs) {
+    if (await page.$(waitSelector).catch(() => null)) return lastStatus;      // sukces: dane są
     const title = await page.title().catch(() => '');
-    if (!/Security check/i.test(title)) break;
-    await page.waitForTimeout(4000);            // managed challenge sam się przeładuje po wykonaniu JS
+    if (isChallengeTitle(title)) {
+      await page.waitForTimeout(3000);                                        // daj JS-challenge czas
+      if (!reloaded && Date.now() - start > maxWaitMs / 2) { reloaded = true; await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {}); }
+      continue;
+    }
+    await page.waitForTimeout(1500);                                          // nie-challenge → poczekaj na render
   }
-  try { await page.waitForSelector(waitSelector, { timeout: 15000 }); } catch (e) {}
   return lastStatus;
 }
 
@@ -232,15 +256,20 @@ async function extractDetail(page, url) {
  * ------------------------------------------------------------------------ */
 // Sitemapę pobieramy PRZEZ KONTEKST STRONY (rozgrzane ciasteczko) — zwykły node-fetch bywa challenge'owany.
 async function fetchModelUrls(page) {
-  const xml = await page.evaluate(async (u) => {
-    const r = await fetch(u, { headers: { accept: 'application/xml,text/xml' } });
-    return await r.text();
-  }, CONFIG.MODEL_SITEMAP);
-  if (/Security check/i.test(xml)) throw new Error('Sitemap modeli: Cloudflare challenge (mimo rozgrzania).');
-  const urls = [];
-  const re = /<loc>([^<]+)<\/loc>/g; let m;
-  while ((m = re.exec(xml)) !== null) urls.push(m[1].trim());
-  return urls;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const xml = await page.evaluate(async (u) => {
+      try { const r = await fetch(u, { headers: { accept: 'application/xml,text/xml' } }); return await r.text(); }
+      catch (e) { return 'FETCHERR:' + (e && e.message); }
+    }, CONFIG.MODEL_SITEMAP);
+    if (xml && xml.indexOf('<loc>') !== -1) {
+      const urls = []; const re = /<loc>([^<]+)<\/loc>/g; let m;
+      while ((m = re.exec(xml)) !== null) urls.push(m[1].trim());
+      return urls;
+    }
+    log('Sitemap modeli: brak danych/Cloudflare (próba ' + attempt + ') — re-warm i ponawiam.');
+    await warmUp(page);
+  }
+  throw new Error('Sitemap modeli: nie udało się pobrać (Cloudflare).');
 }
 
 function collectSkusFromJson(obj, out) {
