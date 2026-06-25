@@ -60,7 +60,12 @@ const CONFIG = {
   REFRESH_PER_RUN: parseInt(process.env.MPB_REFRESH_PER_RUN || '800', 10),  // ile istniejących wierszy odświeżyć / przebieg
   BULK_CONCURRENCY: parseInt(process.env.MPB_BULK_CONCURRENCY || '10', 10), // równoległe fetch-e w kontekście strony
   EVAL_BATCH: 30,                                                           // ile URL-i na jedno page.evaluate
-  DELAY_MS: parseInt(process.env.MPB_DELAY_MS || '300', 10),               // pauza między modelami w discovery
+  DELAY_MS: parseInt(process.env.MPB_DELAY_MS || '200', 10),               // pauza między modelami w discovery
+  // SHARDING: praca dzielona między równoległe joby matrixa (każdy bierze co N-ty model/wiersz).
+  // Zapisy są rozłączne (writeCells), discovery tylko dopisuje, usuwanie zastąpione czyszczeniem
+  // (compact sprząta) → równoległe joby nie kolidują w arkuszu.
+  SHARD_INDEX: parseInt(process.env.MPB_SHARD_INDEX || '0', 10),
+  SHARD_COUNT: Math.max(1, parseInt(process.env.MPB_SHARD_COUNT || '1', 10)),
   NAV_TIMEOUT: 45000,
   SEE_MORE_GUARD: 80,                                                       // limit klików "See more" na model
   USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -301,7 +306,7 @@ async function discoverSkusForModel(page, modelUrl) {
   page.on('response', onResp);
   try {
     await gotoSafe(page, modelUrl);
-    await page.waitForResponse((r) => r.url().includes('/search-service/product/query'), { timeout: 8000 }).catch(() => {});
+    await page.waitForResponse((r) => r.url().includes('/search-service/product/query'), { timeout: 5000 }).catch(() => {});
     const meta = await page.evaluate(() => {
       try {
         const nd = JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
@@ -321,10 +326,10 @@ async function discoverSkusForModel(page, modelUrl) {
       const before = skuSet.size;
       await btn.scrollIntoViewIfNeeded().catch(() => {});
       await Promise.all([
-        page.waitForResponse((r) => r.url().includes('/search-service/product/query'), { timeout: 9000 }).catch(() => {}),
+        page.waitForResponse((r) => r.url().includes('/search-service/product/query'), { timeout: 6000 }).catch(() => {}),
         btn.click({ timeout: 5000 }).catch(() => {}),
       ]);
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(300);
       (await domSkuIds(page)).forEach((s) => skuSet.add(s));
       if (skuSet.size === before) { if (++stale >= 2) break; } else { stale = 0; }
     }
@@ -352,37 +357,42 @@ async function runSelfTest(page) {
 }
 
 async function runRefresh(page, sheet, deadline) {
+  const ci = CONFIG.SHARD_INDEX, cc = CONFIG.SHARD_COUNT;
+  const cursorKey = `refreshCursor_${ci}`;
   const state = await sheet.getState();
-  const startRow = parseInt(state.refreshCursor || '0', 10) || 0;
-  const { slice, total } = await sheet.loadRowsForRefresh(CONFIG.REFRESH_PER_RUN, startRow);
-  if (!total) { log('Refresh: brak istniejących wierszy.'); return; }
-  log(`Refresh: ${slice.length} z ${total} wierszy (kursor ${startRow}).`);
+  const startRow = parseInt(state[cursorKey] || '0', 10) || 0;
+  const { slice, total } = await sheet.loadRowsForRefresh(CONFIG.REFRESH_PER_RUN, startRow, ci, cc);
+  if (!total) { log(`Refresh[shard ${ci}/${cc}]: brak wierszy.`); return; }
+  log(`Refresh[shard ${ci}/${cc}]: ${slice.length} z ${total} (kursor ${startRow}).`);
 
   const byUrl = new Map(slice.map((it) => [it.url, it.row]));
   const details = await enrichUrls(page, slice.map((it) => it.url), deadline);
 
   const cellUpdates = [];
-  const toDelete = [];
+  const toClear = [];
   let processed = 0;
   for (const d of details) {
     const row = byUrl.get(normalizeUrl(d.requestedUrl)) || byUrl.get(d.requestedUrl);
     if (!row) continue;
     processed++;
     if (d.ok) cellUpdates.push(...sheet.buildCellUpdates(row, mapProduct(d)));
-    else if (d.gone) toDelete.push(row);            // egzemplarz zniknął (sprzedany/usunięty)
+    else if (d.gone) toClear.push(row);             // sprzedany/zniknął → wyczyść (compact usunie pusty)
     // challenge/notProduct/parseError → zostaw bez zmian
   }
   await sheet.writeCells(cellUpdates);
-  if (toDelete.length) { log('Refresh: usuwam', toDelete.length, 'sprzedanych/zniknionych.'); await sheet.deleteRows(toDelete); }
-  await sheet.setState({ refreshCursor: String((startRow + processed) % Math.max(1, total)) });
+  if (toClear.length) { log('Refresh: czyszczę', toClear.length, 'sprzedanych (compact usunie puste wiersze).'); await sheet.clearRows(toClear); }
+  await sheet.setState({ [cursorKey]: String((startRow + processed) % Math.max(1, total)) });
   log('Refresh: zaktualizowano komórek:', cellUpdates.length);
 }
 
 async function runDiscover(page, sheet, deadline) {
-  const models = await fetchModelUrls(page);
-  log('Discovery: modeli w sitemapie:', models.length);
+  const ci = CONFIG.SHARD_INDEX, cc = CONFIG.SHARD_COUNT;
+  const all = await fetchModelUrls(page);
+  const models = all.filter((_, i) => i % cc === ci);              // ten shard bierze co N-ty model
+  log(`Discovery[shard ${ci}/${cc}]: ${models.length} z ${all.length} modeli.`);
+  const cursorKey = `discoverCursor_${ci}`;
   const state = await sheet.getState();
-  let cursor = parseInt(state.discoverCursor || '0', 10) || 0;
+  let cursor = parseInt(state[cursorKey] || '0', 10) || 0;
   if (cursor >= models.length) cursor = 0;
 
   const existingSkus = await sheet.loadExistingSkuIds();   // dedup po id SKU
@@ -401,14 +411,22 @@ async function runDiscover(page, sheet, deadline) {
       fresh.forEach((u) => { const id = skuId(u); if (id) existingSkus.add(id); });   // unikaj dubli w tym przebiegu
       const details = await enrichUrls(page, fresh, deadline);
       const products = details.filter((d) => d.ok).map(mapProduct);
-      if (products.length) { await sheet.appendProducts(products); added += products.length; }
+      if (products.length) { await sheet.appendProducts(products); added += products.length; }   // append = bezpieczny równolegle
     }
-    log(`  [${cursor}] ${modelUrl} → ${skuUrls.length} SKU (${fresh.length} nowych)`);
+    if (skuUrls.length) log(`  [${cursor}] ${modelUrl} → ${skuUrls.length} SKU (${fresh.length} nowych)`);
     await sleep(CONFIG.DELAY_MS);
   }
 
-  await sheet.setState({ discoverCursor: String(cursor % Math.max(1, models.length)) });
+  await sheet.setState({ [cursorKey]: String(cursor % Math.max(1, models.length)) });
   log('Discovery: modeli przerobionych:', modelsDone, '| nowych egzemplarzy dopisanych:', added);
+}
+
+// COMPACT (pojedynczy bieg po matrixie): fizycznie usuwa puste wiersze zostawione przez refresh.
+async function runCompact(sheet) {
+  const blanks = await sheet.findBlankRows();
+  if (!blanks.length) { log('Compact: brak pustych wierszy.'); return; }
+  log('Compact: usuwam', blanks.length, 'pustych wierszy.');
+  await sheet.deleteRows(blanks);
 }
 
 /* --------------------------------------------------------------------------
@@ -416,9 +434,11 @@ async function runDiscover(page, sheet, deadline) {
  * ------------------------------------------------------------------------ */
 async function main() {
   const mode = (process.env.MPB_MODE || 'cycle').toLowerCase();
-  log('MPB monitor — tryb:', mode, '| modeli/przebieg:', CONFIG.MODELS_PER_RUN, '| refresh/przebieg:', CONFIG.REFRESH_PER_RUN, '| concurrency:', CONFIG.BULK_CONCURRENCY);
+  log('MPB monitor — tryb:', mode, `| shard ${CONFIG.SHARD_INDEX}/${CONFIG.SHARD_COUNT}`, '| modeli/run:', CONFIG.MODELS_PER_RUN, '| refresh/run:', CONFIG.REFRESH_PER_RUN, '| conc:', CONFIG.BULK_CONCURRENCY);
   const sheet = await new SheetClient(CONFIG.SPREADSHEET_ID, CONFIG.SHEET).init();
   log('Połączono z arkuszem. Kolumny:', JSON.stringify(sheet.cols));
+
+  if (mode === 'compact') { await runCompact(sheet); log('Koniec (compact).'); return; }   // bez przeglądarki
 
   const { browser, page } = await launch();
   const deadline = Date.now() + CONFIG.MAX_RUNTIME_MS;
