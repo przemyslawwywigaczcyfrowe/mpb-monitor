@@ -1,27 +1,27 @@
 name: MPB monitor
 
-# Autonomiczny monitoring cen MPB.com (en-eu) → Google Sheets.
-# Uruchamia się cyklicznie (cron) oraz ręcznie (workflow_dispatch).
+# Autonomiczny monitoring cen MPB.com (en-eu) → Google Sheets — RÓWNOLEGLE (matrix).
+# 10 shardów pracuje jednocześnie (każdy na osobnym runnerze/IP), więc pełny katalog
+# (~12,6 tys. modeli) zbiera się ~10× szybciej, a IP są rozproszone (mniej blokad Cloudflare).
+# Zapisy są bezpieczne równolegle: discovery tylko dopisuje, refresh aktualizuje ROZŁĄCZNE
+# wiersze i CZYŚCI (nie usuwa) sprzedane; puste wiersze sprząta pojedynczy job `compact`.
 #
 # UWAGA: ten plik musi leżeć w .github/workflows/ W KORZENIU repozytorium.
-# Najprościej: utwórz repo, którego KORZENIEM jest zawartość folderu "mpb-monitor"
-# (czyli package.json, scrape-mpb.js, sheets.js i .github/ leżą bezpośrednio w korzeniu).
 
 on:
   schedule:
-    # co godzinę (UTC) — szybkie pierwsze zapełnienie pełnego katalogu (~12,6 tys. modeli).
-    # Gdy katalog będzie już zebrany, możesz rozrzedzić (np. '17 */3 * * *'). https://crontab.guru
+    # co godzinę (UTC). Po zebraniu katalogu możesz rozrzedzić. https://crontab.guru
     - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Tryb: cycle (refresh+discover) | refresh | discover | selftest'
+        description: 'Tryb: cycle (refresh+discover) | refresh | discover | selftest | compact'
         required: true
         default: 'cycle'
         type: choice
-        options: [cycle, refresh, discover, selftest]
+        options: [cycle, refresh, discover, selftest, compact]
 
-# Nie pozwól na nakładanie się przebiegów (kursor w arkuszu jest współdzielony).
+# Nie pozwól, by kolejny zaplanowany bieg nałożył się na trwający (kursory są współdzielone).
 concurrency:
   group: mpb-monitor
   cancel-in-progress: false
@@ -30,6 +30,10 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 55          # > MPB_MAX_RUNTIME_MIN (margines na start + instalację)
+    strategy:
+      fail-fast: false           # padnięcie jednego sharda nie zatrzymuje reszty
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,14 +49,38 @@ jobs:
       - name: Install Chromium (Playwright)
         run: npx playwright install --with-deps chromium
 
-      - name: Run MPB monitor
+      - name: Run MPB monitor (shard ${{ matrix.shard }})
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MPB_SHEET_ID: ${{ vars.MPB_SHEET_ID }}        # opcjonalne; domyślne ID jest w kodzie
           MPB_MODE: ${{ github.event.inputs.mode || 'cycle' }}
+          MPB_SHARD_INDEX: ${{ matrix.shard }}
+          MPB_SHARD_COUNT: '10'
           MPB_MAX_RUNTIME_MIN: '45'
-          MPB_MODELS_PER_RUN: '250'
-          MPB_REFRESH_PER_RUN: '600'
-          MPB_BULK_CONCURRENCY: '10'
-          MPB_DELAY_MS: '300'
+          MPB_MODELS_PER_RUN: '400'
+          MPB_REFRESH_PER_RUN: '3000'
+          MPB_BULK_CONCURRENCY: '12'
+          MPB_DELAY_MS: '150'
+        run: node scrape-mpb.js
+
+  # Po wszystkich shardach: pojedynczy bieg usuwa puste wiersze (po wyczyszczonych sprzedanych).
+  compact:
+    needs: scrape
+    if: ${{ always() && github.event.inputs.mode != 'selftest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: npm install
+      - name: Compact (usuń puste wiersze)
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          MPB_SHEET_ID: ${{ vars.MPB_SHEET_ID }}
+          MPB_MODE: compact
         run: node scrape-mpb.js
