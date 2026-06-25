@@ -51,7 +51,8 @@ jobs:
           MPB_SHEET_ID: ${{ vars.MPB_SHEET_ID }}        # opcjonalne; domyślne ID jest w kodzie
           MPB_MODE: ${{ github.event.inputs.mode || 'cycle' }}
           MPB_MAX_RUNTIME_MIN: '45'
-          MPB_MODELS_PER_RUN: '40'
-          MPB_REFRESH_PER_RUN: '150'
-          MPB_DELAY_MS: '500'
+          MPB_MODELS_PER_RUN: '250'
+          MPB_REFRESH_PER_RUN: '600'
+          MPB_BULK_CONCURRENCY: '10'
+          MPB_DELAY_MS: '300'
         run: node scrape-mpb.js
