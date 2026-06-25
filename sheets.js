@@ -58,6 +58,9 @@ class SheetClient {
     const auth = new google.auth.JWT({ email: creds.client_email, key: creds.private_key, scopes: SCOPES });
     await auth.authorize();
     this.api = google.sheets({ version: 'v4', auth });
+    // Retry z backoffem na 429/5xx — przy 10 równoległych shardach można chwilowo dobić do limitu
+    // API Sheets. 429 = odrzucone (nie zapisane), więc ponowienie POST (append/batchUpdate) jest bezpieczne.
+    google.options({ retry: true, retryConfig: { retry: 6, retryDelay: 1000, httpMethodsToRetry: ['GET', 'POST', 'PUT', 'DELETE'], statusCodesToRetry: [[429, 429], [500, 599]] } });
 
     await this._loadSheetList();
     await this._ensureSheet(this.sheetTitle);
@@ -136,23 +139,25 @@ class SheetClient {
     return set;
   }
 
-  /** Wczytuje pełne wiersze (potrzebne przy odświeżaniu) — zwraca [{row, url}]. */
-  async loadRowsForRefresh(limit, startRow) {
+  /** Wczytuje wiersze do odświeżenia — z SHARDINGIEM (każdy shard bierze co N-ty wiersz z URL-em).
+   *  Zwraca [{row, url}] dla okna [startRow..) tego sharda. Wiersze są ROZŁĄCZNE między shardami,
+   *  więc równoległe writeCells nie kolidują. */
+  async loadRowsForRefresh(limit, startRow, shardIndex = 0, shardCount = 1) {
     const colA1 = colLetter(this.cols.url);
     const res = await this.api.spreadsheets.values.get({
       spreadsheetId: this.spreadsheetId, range: `${this.sheetTitle}!${colA1}2:${colA1}`,
     });
     const vals = res.data.values || [];
-    const out = [];
+    const all = [];
     for (let i = 0; i < vals.length; i++) {
       const u = normalizeUrl(String((vals[i] && vals[i][0]) || '').trim());
-      if (u) out.push({ row: i + 2, url: u });
+      if (u) all.push({ row: i + 2, url: u });
     }
-    // okno [startRow .. startRow+limit) w przestrzeni indeksów listy
-    const from = startRow % Math.max(1, out.length);
+    const mine = all.filter((_, i) => i % shardCount === shardIndex);   // rozłączny podzbiór sharda
+    const from = mine.length ? (startRow % mine.length) : 0;
     const slice = [];
-    for (let k = 0; k < Math.min(limit, out.length); k++) slice.push(out[(from + k) % out.length]);
-    return { slice, total: out.length };
+    for (let k = 0; k < Math.min(limit, mine.length); k++) slice.push(mine[(from + k) % mine.length]);
+    return { slice, total: mine.length };
   }
 
   /** Zapis produktu do KONKRETNEGO wiersza (update). product = {url,name,price,sku,condition,notes,included,...}. */
@@ -224,6 +229,27 @@ class SheetClient {
     }
   }
 
+  /** Czyści zawartość wierszy (A:maxCol) BEZ usuwania — BEZPIECZNE przy równoległych shardach
+   *  (nie przesuwa indeksów). Fizyczne usunięcie pustych wierszy robi osobny, pojedynczy bieg `compact`. */
+  async clearRows(rowNums) {
+    if (!rowNums.length) return;
+    const last = colLetter(Math.max(...Object.values(this.cols)));
+    const ranges = rowNums.map((r) => `${this.sheetTitle}!A${r}:${last}${r}`);
+    for (let i = 0; i < ranges.length; i += 100) {
+      await this.api.spreadsheets.values.batchClear({ spreadsheetId: this.spreadsheetId, requestBody: { ranges: ranges.slice(i, i + 100) } });
+    }
+  }
+
+  /** Numery PUSTYCH wierszy (bez URL) w obszarze danych — do kompaktowania (mode=compact, 1 bieg). */
+  async findBlankRows() {
+    const colA1 = colLetter(this.cols.url);
+    const res = await this.api.spreadsheets.values.get({ spreadsheetId: this.spreadsheetId, range: `${this.sheetTitle}!${colA1}2:${colA1}`, majorDimension: 'COLUMNS' });
+    const vals = (res.data.values && res.data.values[0]) || [];
+    const blanks = [];
+    for (let i = 0; i < vals.length; i++) { if (!String(vals[i] || '').trim()) blanks.push(i + 2); }
+    return blanks;
+  }
+
   // ----- STAN / KURSOR (_mpb_state) -----
   async getState() {
     const res = await this.api.spreadsheets.values.get({ spreadsheetId: this.spreadsheetId, range: `${STATE_SHEET}!A:B` });
@@ -233,16 +259,19 @@ class SheetClient {
     return state;
   }
 
+  // Zapis BEZPIECZNY DLA RÓWNOLEGŁOŚCI: aktualizuje TYLKO podane klucze (każdy shard pisze swój
+  // kursor), zamiast nadpisywać całą zakładkę stanu — inaczej shardy gubiłyby sobie kursory.
   async setState(obj) {
-    const current = await this.getState();
-    const merged = { ...current, ...obj };
-    const rows = Object.keys(merged).map((k) => [k, String(merged[k])]);
-    await this.api.spreadsheets.values.update({
-      spreadsheetId: this.spreadsheetId,
-      range: `${STATE_SHEET}!A1`,
-      valueInputOption: 'RAW',
-      requestBody: { values: rows.length ? rows : [['', '']] },
-    });
+    const res = await this.api.spreadsheets.values.get({ spreadsheetId: this.spreadsheetId, range: `${STATE_SHEET}!A:A` });
+    const keys = (res.data.values || []).map((r) => (r && r[0]) || '');
+    const updates = []; const appends = [];
+    for (const k of Object.keys(obj)) {
+      const idx = keys.indexOf(k);
+      if (idx >= 0) updates.push({ range: `${STATE_SHEET}!B${idx + 1}`, values: [[String(obj[k])]] });
+      else { appends.push([k, String(obj[k])]); keys.push(k); }
+    }
+    if (updates.length) await this.api.spreadsheets.values.batchUpdate({ spreadsheetId: this.spreadsheetId, requestBody: { valueInputOption: 'RAW', data: updates } });
+    if (appends.length) await this.api.spreadsheets.values.append({ spreadsheetId: this.spreadsheetId, range: `${STATE_SHEET}!A1`, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: appends } });
   }
 }
 
