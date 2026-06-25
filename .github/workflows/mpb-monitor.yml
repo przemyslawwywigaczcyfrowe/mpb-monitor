@@ -1,0 +1,57 @@
+name: MPB monitor
+
+# Autonomiczny monitoring cen MPB.com (en-eu) → Google Sheets.
+# Uruchamia się cyklicznie (cron) oraz ręcznie (workflow_dispatch).
+#
+# UWAGA: ten plik musi leżeć w .github/workflows/ W KORZENIU repozytorium.
+# Najprościej: utwórz repo, którego KORZENIEM jest zawartość folderu "mpb-monitor"
+# (czyli package.json, scrape-mpb.js, sheets.js i .github/ leżą bezpośrednio w korzeniu).
+
+on:
+  schedule:
+    # co godzinę (UTC) — szybkie pierwsze zapełnienie pełnego katalogu (~12,6 tys. modeli).
+    # Gdy katalog będzie już zebrany, możesz rozrzedzić (np. '17 */3 * * *'). https://crontab.guru
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Tryb: cycle (refresh+discover) | refresh | discover | selftest'
+        required: true
+        default: 'cycle'
+        type: choice
+        options: [cycle, refresh, discover, selftest]
+
+# Nie pozwól na nakładanie się przebiegów (kursor w arkuszu jest współdzielony).
+concurrency:
+  group: mpb-monitor
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55          # > MPB_MAX_RUNTIME_MIN (margines na start + instalację)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Chromium (Playwright)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run MPB monitor
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          MPB_SHEET_ID: ${{ vars.MPB_SHEET_ID }}        # opcjonalne; domyślne ID jest w kodzie
+          MPB_MODE: ${{ github.event.inputs.mode || 'cycle' }}
+          MPB_MAX_RUNTIME_MIN: '45'
+          MPB_MODELS_PER_RUN: '40'
+          MPB_REFRESH_PER_RUN: '150'
+          MPB_DELAY_MS: '500'
+        run: node scrape-mpb.js
