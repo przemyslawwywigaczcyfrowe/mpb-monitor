@@ -461,6 +461,15 @@ async function runDiscover(page, sheet, deadline) {
   const existingSkus = await sheet.loadExistingSkuIds();   // dedup po id SKU
   const skuId = (u) => { const m = String(u).match(/\/sku-(\d+)/); return m ? m[1] : null; };
   let modelsDone = 0, added = 0;
+  // Dopisujemy paczkami, nie po każdym modelu. Zapisy mają teraz budżet żądań na minutę
+  // (patrz sheets.js), więc trzysta osobnych dopisań zjadłoby cały czas przebiegu na czekaniu.
+  let bufor = [];
+  const dopiszBufor = async () => {
+    if (!bufor.length) return;
+    await sheet.appendProducts(bufor);
+    added += bufor.length;
+    bufor = [];
+  };
 
   for (let i = 0; i < CONFIG.MODELS_PER_RUN && cursor < models.length; i++, cursor++) {
     if (Date.now() > deadline) { log('Discovery: limit czasu — przerywam.'); break; }
@@ -474,12 +483,14 @@ async function runDiscover(page, sheet, deadline) {
       fresh.forEach((u) => { const id = skuId(u); if (id) existingSkus.add(id); });   // unikaj dubli w tym przebiegu
       const details = await enrichUrls(SESJA.page, fresh, deadline);
       const products = details.filter((d) => d.ok).map(mapProduct);
-      if (products.length) { await sheet.appendProducts(products); added += products.length; }   // append = bezpieczny równolegle
+      if (products.length) bufor.push(...products);                    // append = bezpieczny równolegle
+      if (bufor.length >= 100) await dopiszBufor();
     }
     if (skuUrls.length) log(`  [${cursor}] ${modelUrl} → ${skuUrls.length} SKU (${fresh.length} nowych)`);
     await sleep(CONFIG.DELAY_MS);
   }
 
+  await dopiszBufor();
   await sheet.setState({ [cursorKey]: String(cursor % Math.max(1, models.length)) });
   log('Discovery: modeli przerobionych:', modelsDone, '| nowych egzemplarzy dopisanych:', added);
 }
