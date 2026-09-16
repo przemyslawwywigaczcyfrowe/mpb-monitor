@@ -255,10 +255,19 @@ async function enrichUrls(page, urls, deadline) {
   let strona = page;
   let pauza = CONFIG.BULK_PAUSE_MS;
   let odnowien = 0;
+  let paczekNaSesji = 0;
+  // Zmierzone 16.09.2026: jedna sesja przepuszcza mniej więcej dwie paczki po 30 kart, potem
+  // Cloudflare odbija wszystko. Czekanie na tę serię odbić marnuje całą paczkę, więc bierzemy
+  // świeżą sesję zawczasu. Tempo żądań się nie zmienia, zmienia się tylko to, ile z nich wchodzi.
+  const PACZEK_NA_SESJE = 2;
   let pobrane = 0, odbite = 0, sprawdzone = 0;
   for (let i = 0; i < urls.length; i += CONFIG.EVAL_BATCH) {
     if (Date.now() > deadline) { log('enrich: limit czasu — przerywam paczki.'); break; }
     const slice = urls.slice(i, i + CONFIG.EVAL_BATCH);
+    if (paczekNaSesji >= PACZEK_NA_SESJE && Date.now() < deadline) {
+      strona = await odnowKontekst(); odnowien++; paczekNaSesji = 0;
+    }
+    paczekNaSesji++;
     let res = await strona.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
     let challenged = res.filter((r) => r && r.challenge).length;
     if (challenged > slice.length / 3) {                 // ciasteczko wygasło → odśwież i ponów raz
@@ -269,8 +278,8 @@ async function enrichUrls(page, urls, deadline) {
       // Nadal challenge → rozgrzewka nie pomaga, bo spalona jest cała sesja. Bierzemy nową,
       // a tempo zwalniamy tylko trochę i z sufitem, żeby nie zatrzymać przebiegu na dobre.
       if (challenged > slice.length / 3) {
-        if (odnowien < 8 && Date.now() < deadline) {
-          odnowien++;
+        if (Date.now() < deadline) {
+          odnowien++; paczekNaSesji = 0;
           strona = await odnowKontekst();
           res = await strona.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
           challenged = res.filter((r) => r && r.challenge).length;
