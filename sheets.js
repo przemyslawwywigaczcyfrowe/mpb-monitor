@@ -15,6 +15,40 @@ const { google } = require('googleapis');
 const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 const STATE_SHEET = '_mpb_state';
 
+/* ---------------------------------------------------------------------------
+ * LIMIT ZAPISÓW. Google Sheets przyjmuje 60 żądań zapisu na minutę na konto
+ * serwisowe — licznik jest WSPÓLNY dla wszystkich równoległych shardów. Do
+ * 24.08.2026 dziesięć shardów waliło zapisami bez żadnego hamulca, więc przebiegi
+ * kończyły się błędami „Quota exceeded", „The service is currently unavailable"
+ * i „Requested entity was not found" (to ostatnie Sheets zwraca przy przeciążeniu,
+ * mimo że arkusz istnieje). Stąd trzy rzeczy poniżej: własny budżet żądań na shard,
+ * ponawianie z rosnącą przerwą i grupowanie komórek w całe wiersze.
+ * ------------------------------------------------------------------------- */
+const SHARD_COUNT = Math.max(1, parseInt(process.env.MPB_SHARD_COUNT || '1', 10));
+const WRITE_RPM = Math.max(1, Math.floor(50 / SHARD_COUNT));   // 50 z 60 — reszta to zapas
+const WRITE_GAP_MS = Math.ceil(60000 / WRITE_RPM);
+const RETRYABLE = new Set([404, 408, 429, 500, 502, 503, 504]);
+
+const napauza = (ms) => new Promise((r) => setTimeout(r, ms));
+let ostatniZapis = 0;
+
+async function zapisz(etykieta, fn) {
+  for (let proba = 1; proba <= 6; proba++) {
+    const czekaj = ostatniZapis + WRITE_GAP_MS - Date.now();
+    if (czekaj > 0) await napauza(czekaj);
+    ostatniZapis = Date.now();
+    try {
+      return await fn();
+    } catch (e) {
+      const kod = (e && (e.status || e.code)) || 0;
+      if (!RETRYABLE.has(Number(kod)) || proba === 6) throw e;
+      const przerwa = Math.min(60000, 5000 * 2 ** (proba - 1)) + Math.floor(Math.random() * 2000);
+      console.log(`${new Date().toISOString()} ${etykieta}: ${kod} — ponawiam za ${Math.round(przerwa / 1000)} s (próba ${proba}/6)`);
+      await napauza(przerwa);
+    }
+  }
+}
+
 // Nagłówek (lowercase, trim) → kanoniczny klucz pola.
 const HEADER_ALIASES = {
   url:       ['url', 'adres', 'adres url', 'link'],
@@ -77,10 +111,10 @@ class SheetClient {
 
   async _ensureSheet(title) {
     if (this._sheetsByTitle[title]) return;
-    await this.api.spreadsheets.batchUpdate({
+    await zapisz('addSheet', () => this.api.spreadsheets.batchUpdate({
       spreadsheetId: this.spreadsheetId,
       requestBody: { requests: [{ addSheet: { properties: { title } } }] },
-    });
+    }));
     await this._loadSheetList();
   }
 
@@ -91,12 +125,12 @@ class SheetClient {
     const anyFilled = header.some((v) => String(v || '').trim() !== '');
     if (!anyFilled) {
       // pusty arkusz → wpisz domyślny nagłówek (nie nadpisujemy istniejącego układu)
-      await this.api.spreadsheets.values.update({
+      await zapisz('naglowek', () => this.api.spreadsheets.values.update({
         spreadsheetId: this.spreadsheetId,
         range: `${this.sheetTitle}!A1`,
         valueInputOption: 'RAW',
         requestBody: { values: [DEFAULT_HEADER] },
-      });
+      }));
       header = DEFAULT_HEADER.slice();
     }
     this.cols = {};
@@ -179,16 +213,33 @@ class SheetClient {
   /** Zbiorczy zapis pojedynczych komórek (jeden value-range na komórkę → brak nadpisywania sąsiednich kolumn). */
   async writeCells(cellUpdates) {
     if (!cellUpdates.length) return;
-    const data = cellUpdates.map((c) => ({
-      range: `${this.sheetTitle}!${colLetter(c.col)}${c.row}`,
-      values: [[c.value === null || c.value === undefined ? '' : c.value]],
-    }));
+    // Grupujemy komórki jednego wiersza w ciągi sąsiadujących kolumn: zamiast siedmiu
+    // zakresów na wiersz idzie jeden (A5:G5). Siedmiokrotnie mniej żądań, a sąsiednie
+    // kolumny nadal są nietknięte, bo zakres obejmuje wyłącznie kolumny, które piszemy.
+    const wierszami = new Map();
+    for (const c of cellUpdates) {
+      if (!wierszami.has(c.row)) wierszami.set(c.row, []);
+      wierszami.get(c.row).push(c);
+    }
+    const data = [];
+    for (const [row, komorki] of wierszami) {
+      komorki.sort((a, b) => a.col - b.col);
+      let i = 0;
+      while (i < komorki.length) {
+        let j = i;
+        while (j + 1 < komorki.length && komorki[j + 1].col === komorki[j].col + 1) j++;
+        const wartosci = komorki.slice(i, j + 1).map((c) => (c.value === null || c.value === undefined ? '' : c.value));
+        const od = colLetter(komorki[i].col), doK = colLetter(komorki[j].col);
+        data.push({ range: `${this.sheetTitle}!${od}${row}:${doK}${row}`, values: [wartosci] });
+        i = j + 1;
+      }
+    }
     // chunkujemy, żeby nie przekroczyć limitów pojedynczego żądania
     for (let i = 0; i < data.length; i += 500) {
-      await this.api.spreadsheets.values.batchUpdate({
+      await zapisz('writeCells', () => this.api.spreadsheets.values.batchUpdate({
         spreadsheetId: this.spreadsheetId,
         requestBody: { valueInputOption: 'RAW', data: data.slice(i, i + 500) },
-      });
+      }));
     }
   }
 
@@ -204,13 +255,13 @@ class SheetClient {
       set('updated', p.updated); set('status', p.status);
       return arr;
     });
-    await this.api.spreadsheets.values.append({
+    await zapisz('appendProducts', () => this.api.spreadsheets.values.append({
       spreadsheetId: this.spreadsheetId,
       range: `${this.sheetTitle}!A1`,
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: rows },
-    });
+    }));
   }
 
   /** Usuwa wiersz po numerze (np. produkt sprzedany / zniknął). Wymaga sheetId. */
@@ -222,10 +273,10 @@ class SheetClient {
       deleteDimension: { range: { sheetId, dimension: 'ROWS', startIndex: r - 1, endIndex: r } },
     }));
     for (let i = 0; i < requests.length; i += 200) {
-      await this.api.spreadsheets.batchUpdate({
+      await zapisz('deleteRows', () => this.api.spreadsheets.batchUpdate({
         spreadsheetId: this.spreadsheetId,
         requestBody: { requests: requests.slice(i, i + 200) },
-      });
+      }));
     }
   }
 
@@ -236,7 +287,7 @@ class SheetClient {
     const last = colLetter(Math.max(...Object.values(this.cols)));
     const ranges = rowNums.map((r) => `${this.sheetTitle}!A${r}:${last}${r}`);
     for (let i = 0; i < ranges.length; i += 100) {
-      await this.api.spreadsheets.values.batchClear({ spreadsheetId: this.spreadsheetId, requestBody: { ranges: ranges.slice(i, i + 100) } });
+      await zapisz('clearRows', () => this.api.spreadsheets.values.batchClear({ spreadsheetId: this.spreadsheetId, requestBody: { ranges: ranges.slice(i, i + 100) } }));
     }
   }
 
@@ -270,8 +321,8 @@ class SheetClient {
       if (idx >= 0) updates.push({ range: `${STATE_SHEET}!B${idx + 1}`, values: [[String(obj[k])]] });
       else { appends.push([k, String(obj[k])]); keys.push(k); }
     }
-    if (updates.length) await this.api.spreadsheets.values.batchUpdate({ spreadsheetId: this.spreadsheetId, requestBody: { valueInputOption: 'RAW', data: updates } });
-    if (appends.length) await this.api.spreadsheets.values.append({ spreadsheetId: this.spreadsheetId, range: `${STATE_SHEET}!A1`, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: appends } });
+    if (updates.length) await zapisz('setState', () => this.api.spreadsheets.values.batchUpdate({ spreadsheetId: this.spreadsheetId, requestBody: { valueInputOption: 'RAW', data: updates } }));
+    if (appends.length) await zapisz('setState', () => this.api.spreadsheets.values.append({ spreadsheetId: this.spreadsheetId, range: `${STATE_SHEET}!A1`, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: appends } }));
   }
 }
 
