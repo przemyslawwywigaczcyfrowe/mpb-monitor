@@ -58,7 +58,12 @@ const CONFIG = {
   MAX_RUNTIME_MS: (parseInt(process.env.MPB_MAX_RUNTIME_MIN || '45', 10)) * 60 * 1000,
   MODELS_PER_RUN: parseInt(process.env.MPB_MODELS_PER_RUN || '300', 10),    // ile modeli w discovery / przebieg
   REFRESH_PER_RUN: parseInt(process.env.MPB_REFRESH_PER_RUN || '800', 10),  // ile istniejących wierszy odświeżyć / przebieg
-  BULK_CONCURRENCY: parseInt(process.env.MPB_BULK_CONCURRENCY || '10', 10), // równoległe fetch-e w kontekście strony
+  BULK_CONCURRENCY: parseInt(process.env.MPB_BULK_CONCURRENCY || '2', 10),  // równoległe fetch-e w kontekście strony
+  // Przerwa między paczkami fetch-ów. Przy koncurencji 8 i przerwie 120 ms szło ~40 żądań na
+  // sekundę, a robots.txt MPB prosi o jedno na sekundę. 16.09.2026 Cloudflare odpowiedział na to
+  // challenge'em na wszystko: z 15 000 prób odświeżenia weszło 365 produktów, czyli 2,4%.
+  // Dwa równoległe żądania co 800 ms to ~2,5 na sekundę i mieści się blisko prośby sklepu.
+  BULK_PAUSE_MS: parseInt(process.env.MPB_BULK_PAUSE_MS || '800', 10),
   EVAL_BATCH: 30,                                                           // ile URL-i na jedno page.evaluate
   DELAY_MS: parseInt(process.env.MPB_DELAY_MS || '200', 10),               // pauza między modelami w discovery
   // SHARDING: praca dzielona między równoległe joby matrixa (każdy bierze co N-ty model/wiersz).
@@ -176,7 +181,7 @@ async function gotoSafe(page, url, { waitSelector = '#__NEXT_DATA__', maxWaitMs 
  *  Zwraca [{ ok, urlPath, productInfo } | { gone } | { challenge } | { notProduct }]
  * ------------------------------------------------------------------------ */
 // Funkcja wykonywana W PRZEGLĄDARCE: pobiera paczkę URL-i równolegle i parsuje __NEXT_DATA__.
-function inPageFetchParse({ urls, conc, base }) {
+function inPageFetchParse({ urls, conc, base, pauza }) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   function parse(html, requestedUrl) {
     const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -201,12 +206,15 @@ function inPageFetchParse({ urls, conc, base }) {
       const chunk = urls.slice(i, i + conc);
       const res = await Promise.all(chunk.map((u) => {
         const rel = u.indexOf(base) === 0 ? u.slice(base.length) : u;  // fetch względny → to samo origin
-        return fetch(rel, { headers: { accept: 'text/html' }, redirect: 'follow' })
+        // Nagłówek jak przy wejściu na stronę, a nie jak przy zapytaniu w tle — Cloudflare
+        // punktuje `accept: text/html` jako ruch automatu.
+        const accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
+        return fetch(rel, { headers: { accept: accept }, redirect: 'follow' })
           .then((r) => (r.status === 404 || r.status === 410) ? { requestedUrl: u, gone: true } : r.text().then((t) => parse(t, u)))
           .catch((e) => ({ requestedUrl: u, err: String(e && e.message || e) }));
       }));
       out.push(...res);
-      if (i + conc < urls.length) await sleep(120);
+      if (i + conc < urls.length) await sleep(pauza);
     }
     return out;
   })();
@@ -215,18 +223,30 @@ function inPageFetchParse({ urls, conc, base }) {
 // Node-owa pętla: dzieli listę na paczki EVAL_BATCH, ponawia z re-warm gdy sypią się challenge.
 async function enrichUrls(page, urls, deadline) {
   const results = [];
+  let pauza = CONFIG.BULK_PAUSE_MS;
+  let pobrane = 0, odbite = 0;
   for (let i = 0; i < urls.length; i += CONFIG.EVAL_BATCH) {
     if (Date.now() > deadline) { log('enrich: limit czasu — przerywam paczki.'); break; }
     const slice = urls.slice(i, i + CONFIG.EVAL_BATCH);
-    let res = await page.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE });
-    const challenged = res.filter((r) => r && r.challenge).length;
+    let res = await page.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
+    let challenged = res.filter((r) => r && r.challenge).length;
     if (challenged > slice.length / 3) {                 // ciasteczko wygasło → odśwież i ponów raz
       log('enrich: dużo challenge (', challenged, ') → re-warm i ponawiam paczkę.');
       await warmUp(page);
-      res = await page.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE });
+      res = await page.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
+      challenged = res.filter((r) => r && r.challenge).length;
+      // Jeśli po odświeżeniu ciasteczka nadal sypie challenge'ami, to nie ciasteczko jest problemem
+      // tylko tempo. Zwalniamy na resztę przebiegu, zamiast dalej walić w zamknięte drzwi.
+      if (challenged > slice.length / 3 && pauza < 6000) {
+        pauza = Math.min(6000, Math.round(pauza * 1.8));
+        log('enrich: zwalniam, przerwa między paczkami:', pauza, 'ms');
+      }
     }
+    pobrane += res.filter((r) => r && r.ok).length;
+    odbite += challenged;
     results.push(...res);
   }
+  log(`enrich: pobrano ${pobrane} z ${urls.length} (odbitych challenge'em: ${odbite}, przerwa ${pauza} ms)`);
   return results;
 }
 
