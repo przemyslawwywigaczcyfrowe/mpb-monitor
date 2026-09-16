@@ -1,0 +1,26 @@
+name: Utrzymanie harmonogramu
+
+# Po 60 dniach bez żadnej aktywności w repozytorium GitHub SAM wyłącza harmonogramy
+# (stan „disabled_inactivity") i monitoring cicho przestaje chodzić — dokładnie to stało się
+# 24.08.2026. Ten przebieg raz w miesiącu robi pusty commit, więc licznik bezczynności
+# nigdy nie dochodzi do 60 dni.
+
+on:
+  schedule:
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pusty-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pusty commit (reset licznika bezczynności)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Utrzymanie harmonogramu (pusty commit)"
+          git push
