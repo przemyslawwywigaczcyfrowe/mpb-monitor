@@ -19,11 +19,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Tryb: cycle (refresh+discover) | refresh | discover | selftest | compact'
+        description: 'Tryb: auto (harmonogram) | cycle (refresh+discover) | refresh | discover | selftest | compact'
         required: true
-        default: 'cycle'
+        default: 'auto'
         type: choice
-        options: [cycle, refresh, discover, selftest, compact]
+        options: [auto, cycle, refresh, discover, selftest, compact]
 
 # Nie pozwól, by kolejny zaplanowany bieg nałożył się na trwający (kursory są współdzielone).
 concurrency:
@@ -57,7 +57,7 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MPB_SHEET_ID: ${{ vars.MPB_SHEET_ID }}        # opcjonalne; domyślne ID jest w kodzie
-          MPB_MODE: ${{ github.event.inputs.mode || 'cycle' }}
+          MPB_MODE: ${{ github.event.inputs.mode || 'auto' }}
           MPB_SHARD_INDEX: ${{ matrix.shard }}
           MPB_SHARD_COUNT: '5'
           MPB_MAX_RUNTIME_MIN: '45'
