@@ -62,8 +62,9 @@ jobs:
           MPB_SHARD_COUNT: '5'
           MPB_MAX_RUNTIME_MIN: '45'
           MPB_MODELS_PER_RUN: '400'
-          MPB_REFRESH_PER_RUN: '3000'
-          MPB_BULK_CONCURRENCY: '8'
+          MPB_REFRESH_PER_RUN: '1500'
+          MPB_BULK_CONCURRENCY: '2'
+          MPB_BULK_PAUSE_MS: '800'
           MPB_DELAY_MS: '150'
         run: node scrape-mpb.js
 
