@@ -255,19 +255,10 @@ async function enrichUrls(page, urls, deadline) {
   let strona = page;
   let pauza = CONFIG.BULK_PAUSE_MS;
   let odnowien = 0;
-  let paczekNaSesji = 0;
-  // Zmierzone 16.09.2026: jedna sesja przepuszcza mniej więcej dwie paczki po 30 kart, potem
-  // Cloudflare odbija wszystko. Czekanie na tę serię odbić marnuje całą paczkę, więc bierzemy
-  // świeżą sesję zawczasu. Tempo żądań się nie zmienia, zmienia się tylko to, ile z nich wchodzi.
-  const PACZEK_NA_SESJE = 2;
   let pobrane = 0, odbite = 0, sprawdzone = 0;
   for (let i = 0; i < urls.length; i += CONFIG.EVAL_BATCH) {
     if (Date.now() > deadline) { log('enrich: limit czasu — przerywam paczki.'); break; }
     const slice = urls.slice(i, i + CONFIG.EVAL_BATCH);
-    if (paczekNaSesji >= PACZEK_NA_SESJE && Date.now() < deadline) {
-      strona = await odnowKontekst(); odnowien++; paczekNaSesji = 0;
-    }
-    paczekNaSesji++;
     let res = await strona.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
     let challenged = res.filter((r) => r && r.challenge).length;
     if (challenged > slice.length / 3) {                 // ciasteczko wygasło → odśwież i ponów raz
@@ -278,8 +269,8 @@ async function enrichUrls(page, urls, deadline) {
       // Nadal challenge → rozgrzewka nie pomaga, bo spalona jest cała sesja. Bierzemy nową,
       // a tempo zwalniamy tylko trochę i z sufitem, żeby nie zatrzymać przebiegu na dobre.
       if (challenged > slice.length / 3) {
-        if (Date.now() < deadline) {
-          odnowien++; paczekNaSesji = 0;
+        if (odnowien < 8 && Date.now() < deadline) {
+          odnowien++;
           strona = await odnowKontekst();
           res = await strona.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
           challenged = res.filter((r) => r && r.challenge).length;
@@ -516,7 +507,15 @@ async function runCompact(sheet) {
  *  MAIN
  * ------------------------------------------------------------------------ */
 async function main() {
-  const mode = (process.env.MPB_MODE || 'cycle').toLowerCase();
+  let mode = (process.env.MPB_MODE || 'cycle').toLowerCase();
+  // Tryb `auto` (tak chodzi harmonogram): raz na cztery godziny pełny cykl z dobieraniem nowych
+  // egzemplarzy, w pozostałych godzinach samo odświeżanie cen. Powód jest zmierzony: w trybie
+  // `cycle` odświeżanie dostaje pół czasu, więc przez dobę odświeża się o połowę mniej kart,
+  // a nowe egzemplarze i tak przybywają wolniej, niż zmieniają się ceny.
+  if (mode === 'auto') {
+    mode = (new Date().getUTCHours() % 4 === 0) ? 'cycle' : 'refresh';
+    log('tryb auto → ' + mode);
+  }
   log('MPB monitor — tryb:', mode, `| shard ${CONFIG.SHARD_INDEX}/${CONFIG.SHARD_COUNT}`, '| modeli/run:', CONFIG.MODELS_PER_RUN, '| refresh/run:', CONFIG.REFRESH_PER_RUN, '| conc:', CONFIG.BULK_CONCURRENCY);
   const sheet = await new SheetClient(CONFIG.SPREADSHEET_ID, CONFIG.SHEET).init();
   log('Połączono z arkuszem. Kolumny:', JSON.stringify(sheet.cols));
