@@ -114,23 +114,52 @@ function mapProduct(detail) {
 /* --------------------------------------------------------------------------
  *  PRZEGLĄDARKA
  * ------------------------------------------------------------------------ */
-async function launch() {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
-  });
-  const context = await browser.newContext({
-    userAgent: CONFIG.USER_AGENT,
-    locale: 'en-GB',
-    viewport: { width: 1366, height: 900 },
-    extraHTTPHeaders: { 'Accept-Language': 'en-GB,en;q=0.9' },
-  });
+// Ustawienia kontekstu trzymamy osobno, bo kontekst zakładamy nie tylko na starcie:
+// przy serii challenge'ów zakładamy go od nowa (świeże ciasteczka Cloudflare).
+const USTAWIENIA_KONTEKSTU = {
+  locale: 'en-GB',
+  viewport: { width: 1366, height: 900 },
+  extraHTTPHeaders: { 'Accept-Language': 'en-GB,en;q=0.9' },
+};
+
+// Bieżąca sesja przeglądarki. Po odnowieniu kontekstu zmienia się `page`, więc funkcje
+// pracujące dłużej niż jedna paczka muszą sięgać po stronę przez SESJA, nie po swój parametr.
+let SESJA = null;
+
+async function nowaStrona(browser) {
+  const context = await browser.newContext(Object.assign({ userAgent: CONFIG.USER_AGENT }, USTAWIENIA_KONTEKSTU));
   await context.addInitScript(() => {
     try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
   });
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(CONFIG.NAV_TIMEOUT);
+  return { context, page };
+}
+
+async function launch() {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
+  });
+  const { context, page } = await nowaStrona(browser);
+  SESJA = { browser, context, page };
   return { browser, context, page };
+}
+
+/**
+ * Zakłada kontekst od nowa i rozgrzewa go. Po co: samo ponowne wejście na stronę główną
+ * (`warmUp`) nie kasuje oceny, jaką Cloudflare przypisał tej sesji, więc po serii challenge'ów
+ * stare ciasteczka są już spalone i trzeba wziąć nowe. Zmierzone 16.09.2026: sama rozgrzewka
+ * w kółko nie odblokowywała pobierania, przepuszczalność stała w miejscu.
+ */
+async function odnowKontekst() {
+  const stary = SESJA.context;
+  const { context, page } = await nowaStrona(SESJA.browser);
+  SESJA.context = context; SESJA.page = page;
+  await stary.close().catch(() => {});
+  log('enrich: zakładam nową sesję przeglądarki (świeże ciasteczka Cloudflare).');
+  await warmUp(page);
+  return page;
 }
 
 // Wejście na stronę nie-chronioną → Cloudflare ustawia/odświeża cookie __cf_bm w kontekście.
@@ -223,30 +252,44 @@ function inPageFetchParse({ urls, conc, base, pauza }) {
 // Node-owa pętla: dzieli listę na paczki EVAL_BATCH, ponawia z re-warm gdy sypią się challenge.
 async function enrichUrls(page, urls, deadline) {
   const results = [];
+  let strona = page;
   let pauza = CONFIG.BULK_PAUSE_MS;
-  let pobrane = 0, odbite = 0;
+  let odnowien = 0;
+  let pobrane = 0, odbite = 0, sprawdzone = 0;
   for (let i = 0; i < urls.length; i += CONFIG.EVAL_BATCH) {
     if (Date.now() > deadline) { log('enrich: limit czasu — przerywam paczki.'); break; }
     const slice = urls.slice(i, i + CONFIG.EVAL_BATCH);
-    let res = await page.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
+    let res = await strona.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
     let challenged = res.filter((r) => r && r.challenge).length;
     if (challenged > slice.length / 3) {                 // ciasteczko wygasło → odśwież i ponów raz
       log('enrich: dużo challenge (', challenged, ') → re-warm i ponawiam paczkę.');
-      await warmUp(page);
-      res = await page.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
+      await warmUp(strona);
+      res = await strona.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
       challenged = res.filter((r) => r && r.challenge).length;
-      // Jeśli po odświeżeniu ciasteczka nadal sypie challenge'ami, to nie ciasteczko jest problemem
-      // tylko tempo. Zwalniamy na resztę przebiegu, zamiast dalej walić w zamknięte drzwi.
-      if (challenged > slice.length / 3 && pauza < 6000) {
-        pauza = Math.min(6000, Math.round(pauza * 1.8));
-        log('enrich: zwalniam, przerwa między paczkami:', pauza, 'ms');
+      // Nadal challenge → rozgrzewka nie pomaga, bo spalona jest cała sesja. Bierzemy nową,
+      // a tempo zwalniamy tylko trochę i z sufitem, żeby nie zatrzymać przebiegu na dobre.
+      if (challenged > slice.length / 3) {
+        if (odnowien < 8 && Date.now() < deadline) {
+          odnowien++;
+          strona = await odnowKontekst();
+          res = await strona.evaluate(inPageFetchParse, { urls: slice, conc: CONFIG.BULK_CONCURRENCY, base: BASE, pauza: pauza });
+          challenged = res.filter((r) => r && r.challenge).length;
+        }
+        if (challenged > slice.length / 3 && pauza < 3000) {
+          pauza = Math.min(3000, Math.round(pauza * 1.5));
+          log('enrich: zwalniam, przerwa między paczkami:', pauza, 'ms');
+        }
       }
+    } else if (pauza > CONFIG.BULK_PAUSE_MS) {
+      pauza = Math.max(CONFIG.BULK_PAUSE_MS, Math.round(pauza * 0.8));   // czysta paczka → wracamy do tempa
     }
+    sprawdzone += slice.length;
     pobrane += res.filter((r) => r && r.ok).length;
     odbite += challenged;
     results.push(...res);
   }
-  log(`enrich: pobrano ${pobrane} z ${urls.length} (odbitych challenge'em: ${odbite}, przerwa ${pauza} ms)`);
+  const proc = sprawdzone ? Math.round((pobrane / sprawdzone) * 100) : 0;
+  log(`enrich: pobrano ${pobrane} z ${sprawdzone} sprawdzonych (${proc}%), odbitych challenge'em: ${odbite}, nowych sesji: ${odnowien}, przerwa ${pauza} ms`);
   return results;
 }
 
@@ -386,7 +429,7 @@ async function runRefresh(page, sheet, deadline) {
   log(`Refresh[shard ${ci}/${cc}]: ${slice.length} z ${total} (kursor ${startRow}).`);
 
   const byUrl = new Map(slice.map((it) => [it.url, it.row]));
-  const details = await enrichUrls(page, slice.map((it) => it.url), deadline);
+  const details = await enrichUrls(SESJA.page, slice.map((it) => it.url), deadline);
 
   const cellUpdates = [];
   const toClear = [];
@@ -407,7 +450,7 @@ async function runRefresh(page, sheet, deadline) {
 
 async function runDiscover(page, sheet, deadline) {
   const ci = CONFIG.SHARD_INDEX, cc = CONFIG.SHARD_COUNT;
-  const all = await fetchModelUrls(page);
+  const all = await fetchModelUrls(SESJA.page);
   const models = all.filter((_, i) => i % cc === ci);              // ten shard bierze co N-ty model
   log(`Discovery[shard ${ci}/${cc}]: ${models.length} z ${all.length} modeli.`);
   const cursorKey = `discoverCursor_${ci}`;
@@ -423,13 +466,13 @@ async function runDiscover(page, sheet, deadline) {
     if (Date.now() > deadline) { log('Discovery: limit czasu — przerywam.'); break; }
     const modelUrl = models[cursor];
     let skuUrls = [];
-    try { skuUrls = await discoverSkusForModel(page, modelUrl); }
+    try { skuUrls = await discoverSkusForModel(SESJA.page, modelUrl); }
     catch (e) { log('Discovery: błąd modelu', modelUrl, '-', e.message); }
     modelsDone++;
     const fresh = skuUrls.filter((u) => { const id = skuId(u); return id && !existingSkus.has(id); });
     if (fresh.length) {
       fresh.forEach((u) => { const id = skuId(u); if (id) existingSkus.add(id); });   // unikaj dubli w tym przebiegu
-      const details = await enrichUrls(page, fresh, deadline);
+      const details = await enrichUrls(SESJA.page, fresh, deadline);
       const products = details.filter((d) => d.ok).map(mapProduct);
       if (products.length) { await sheet.appendProducts(products); added += products.length; }   // append = bezpieczny równolegle
     }
